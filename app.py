@@ -89,45 +89,140 @@ class CLIP4ClipModel(BaseAIModel):
         text_features = text_features / text_features.norm(p=2, dim=-1, keepdim=True)
         return text_features[0].tolist()
 
-class FinalGLSCLModel(BaseAIModel):
-    """GLSCL/DiCoSA Final Model Wrapper"""
+
+class ClipperCustomModel(BaseAIModel):
+    """Your proprietary local model using the Clipper architecture."""
+    def __init__(self):
+        import torch
+        # Import your local custom Python files!
+        try:
+            from config import ClipperConfig
+            from model import ClipperModel
+        except ImportError:
+            st.error("Missing config.py or model.py! Please put them in the same folder as app.py.")
+            st.stop()
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.weights_path = "clipper_best.pt" # Ensure this file is in your folder!
+        
+        # Load your custom architecture
+        self.config = ClipperConfig()
+        self.config.use_custom_modules = True
+        self.model = ClipperModel(self.config).eval().to(self.device)
+        
+        # Load your custom weights
+        if os.path.exists(self.weights_path):
+            ckpt = torch.load(self.weights_path, map_location=self.device)
+            self.model.load_state_dict(ckpt, strict=False)
+        else:
+            st.warning(f"Weights not found at {self.weights_path}. Running zero-shot mode.")
+
+    def get_video_embedding(self, video_path):
+        import cv2
+        from PIL import Image
+        import torch
+        
+        # We use your exact custom frame sampling logic via OpenCV
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        idxs = np.linspace(0, max(0, total_f - 1), self.config.num_frames, dtype=int)
+        frames = []
+        for idx in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
+            ok, fr = cap.read()
+            if ok:
+                frames.append(cv2.cvtColor(fr, cv2.COLOR_BGR2RGB))
+        cap.release()
+        
+        while len(frames) < self.config.num_frames:
+            frames.append(frames[-1] if frames else np.zeros((224, 224, 3), dtype=np.uint8))
+        frames = frames[:self.config.num_frames]
+        
+        imgs = [self.model.preprocess(Image.fromarray(f)) for f in frames]
+        x = torch.stack(imgs).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            # Get your custom embeddings
+            clip_e, frame_e = self.model.encode_video(x)
+            
+        # We return the primary global clip embedding for ChromaDB
+        return clip_e.squeeze().tolist()
+
+    def get_text_embedding(self, text):
+        import torch
+        with torch.no_grad():
+            tokens = self.model.tokenizer([text]).to(self.device)
+            t_emb, c_emb = self.model.encode_text(tokens)
+            
+        # Return the primary text embedding
+        return t_emb.squeeze().tolist()
+
+class ClipAdvancedModel(BaseAIModel):
+    """CLIP Advanced Model Wrapper"""
     def __init__(self):
         import sys
         import os
         from types import SimpleNamespace
         from transformers import CLIPProcessor
         
-        sys.path.append(os.path.join(os.path.dirname(__file__), 'final model'))
-        from final_model import modeling
+        # Ensure folder is named 'final_model' with an underscore
+        sys.path.append(os.path.join(os.path.dirname(__file__), 'final_model'))
+        try:
+            from final_model import modeling
+        except ImportError:
+            st.error("Could not import final_model.modeling. Check your folder structure.")
+            st.stop()
         
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         self.config = SimpleNamespace(
-            interaction='no',
-            agg_module='meanP',
+            interaction='wti',
+            agg_module='seqTransf',
             base_encoder='ViT-B/32',
             center=1,
             query_number=8,
-            cross_att_layer=2,
+            cross_att_layer=3,
             num_hidden_layers=4,
-            temp=0.07,
-            loss2_weight=1.0,
-            alpha=1.0,
-            beta=1.0,
+            temp=3.0,
+            loss2_weight=0.5,
+            alpha=0.0001,
+            beta=0.005,
             query_share=True,
-            cross_att_share=True
+            cross_att_share=True,
+            max_frames=12,
+            max_words=32
         )
         
+        # 🚨 THE MISSING LINE: We must create the empty model BEFORE we load weights!
         self.model = modeling.DiCoSA(self.config).to(self.device).eval()
         
-        self.weights_path = os.path.join("final model", "final_model.pt")
+        # Now we locate and load your trained Kaggle weights
+        self.weights_path = "pytorch_model.bin.best.2"
+        
         if os.path.exists(self.weights_path):
             ckpt = torch.load(self.weights_path, map_location=self.device)
-            self.model.load_state_dict(ckpt, strict=False)
             
-        # We'll use HuggingFace's processor to format images/text into the tensors DiCoSA expects
+            # Strip the "module." prefix from the Kaggle multi-GPU weights
+            unwrapped_ckpt = {}
+            for k, v in ckpt.items():
+                new_k = k.replace("module.", "") if k.startswith("module.") else k
+                unwrapped_ckpt[new_k] = v
+                
+            # Load the cleaned weights into the model
+            missing, unexpected = self.model.load_state_dict(unwrapped_ckpt, strict=False)
+            print(f"✅ SUCCESSFULLY LOADED GLSCL BRAIN: {self.weights_path}")
+            
+            # This will warn us if the weights still aren't mapping correctly
+            if len(missing) > 0:
+                print(f"⚠️ Warning: Missing keys detected: {missing[:5]}...")
+        else:
+            print(f"❌ ERROR: Could not find {self.weights_path}. Model will use random weights.")
+            
         self.processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-
+        self.video_cache = {}
+        
     def get_video_embedding(self, video_path):
         import cv2
         import torch
@@ -135,7 +230,8 @@ class FinalGLSCLModel(BaseAIModel):
         
         cap = cv2.VideoCapture(video_path)
         total_f = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        num_frames = getattr(self.config, 'num_frames', 8)
+        
+        num_frames = getattr(self.config, 'max_frames', 12)
         idxs = np.linspace(0, max(0, total_f - 1), num_frames, dtype=int)
         
         frames = []
@@ -151,52 +247,28 @@ class FinalGLSCLModel(BaseAIModel):
             
         imgs = [Image.fromarray(f) for f in frames]
         
-        # 1. Preprocess the frames using CLIP's standard transforms
         inputs = self.processor(images=imgs, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].to(self.device) # Shape: [num_frames, 3, 224, 224]
+        pixel_values = inputs["pixel_values"].to(self.device) 
         
-        # 2. DiCoSA expects an extra batch dimension: [batch_size, num_frames, channels, height, width]
         video_tensor = pixel_values.unsqueeze(0) 
-        
-        # 3. Create a mask (1s meaning all frames are valid)
         video_mask = torch.ones((1, len(frames))).to(self.device)
         
         with torch.no_grad():
-            # Get the sequence of frame features natively via DiCoSA
-            video_emb = self.model.get_video_feat(video_tensor, video_mask)
-            # Average the frames
-            video_emb = video_emb.mean(dim=1).squeeze()
+            video_feat = self.model.get_video_feat(video_tensor, video_mask)
             
-            # ✨ THE FIX: Normalize the vector so ChromaDB math works!
-            video_emb = F.normalize(video_emb, p=2, dim=-1)
+        # FIX: Store the true, un-averaged tensors in memory!
+        self.video_cache[video_path] = {
+            "video_feat": video_feat.cpu(),
+            "video_mask": video_mask.cpu()
+        }
             
-            
+        # Dummy return for ChromaDB
+        video_emb = video_feat.mean(dim=1).squeeze()
+        video_emb = F.normalize(video_emb, p=2, dim=-1)
         return video_emb.tolist()
 
     def get_text_embedding(self, text):
-        import torch
-        
-        # Tokenize to get standard input_ids and attention_mask
-        inputs = self.processor(
-            text=[text], 
-            return_tensors="pt", 
-            padding="max_length", 
-            truncation=True, 
-            max_length=77
-        )
-        text_ids = inputs["input_ids"].to(self.device)
-        text_mask = inputs["attention_mask"].to(self.device)
-        
-        with torch.no_grad():
-            # DiCoSA's get_text_feat returns (text_feat, cls_feat)
-            text_feat, cls_feat = self.model.get_text_feat(text_ids, text_mask)
-            # We want the global CLS token feature
-            text_emb = cls_feat.squeeze()
-            
-            # ✨ THE FIX: Normalize the vector so ChromaDB math works!
-            text_emb = F.normalize(text_emb, p=2, dim=-1)
-            
-        return text_emb.tolist()
+        return np.zeros(512).tolist()
 
 class CLIPflowCustomModel(BaseAIModel):
     """The Uncompromised CLIPflow Phase I Engine"""
@@ -240,6 +312,9 @@ class CLIPflowCustomModel(BaseAIModel):
         x = visual.transformer(x)
         x = x.permute(1, 0, 2)
 
+        # ✨ BUG 2 FIX: Add the missing Post-LayerNorm! ✨
+        x = visual.ln_post(x)
+
         if visual.proj is not None:
             x = x @ visual.proj
             
@@ -273,10 +348,19 @@ class CLIPflowCustomModel(BaseAIModel):
             "global": video_global.float(),
             "patches": video_patches.float()
         }
-        return video_global.mean(dim=0).tolist() # Dummy return for Streamlit
+        
+        # ✨ BUG 1 FIX: Return actual normalized embeddings instead of zeros
+        vid_emb = video_global.mean(dim=0)
+        vid_emb = F.normalize(vid_emb, p=2, dim=-1)
+        return vid_emb.tolist() 
 
     def get_text_embedding(self, text):
-        return np.zeros(512).tolist()
+        # ✨ BUG 1 FIX: Return actual normalized embeddings instead of zeros
+        text_tokens = self.clip_tokenizer([text]).to(self.device)
+        with torch.no_grad():
+            text_features = self.clip_model.encode_text(text_tokens)
+            text_features = F.normalize(text_features, p=2, dim=-1)
+        return text_features[0].tolist()
     
 # --- 2. THE DATABASE SETUP ---
 client = chromadb.Client()
@@ -344,7 +428,7 @@ selected_model = st.sidebar.selectbox(
         "Searchium CLIP4Clip (High Accuracy)", 
         "Clipper (Custom Local Model)",  
         "CLIPflow (Custom Engine)", 
-        "GLSCL/DiCoSA (Final Model)",
+        "CLIP Advanced",
         "Dummy Model (Fast Testing)"
     ]
 )
@@ -360,13 +444,13 @@ def load_clip4clip(): return CLIP4ClipModel()
 @st.cache_resource
 def load_clipflow(): return CLIPflowCustomModel()
 @st.cache_resource
-def load_final_model(): return FinalGLSCLModel()
+def load_final_model(): return ClipAdvancedModel()
 
 if selected_model == "Original CLIP (Baseline)": model = load_baseline()
 elif selected_model == "Searchium CLIP4Clip (High Accuracy)": model = load_clip4clip()
 elif selected_model == "Clipper (Custom Local Model)": model = load_clipper()
 elif selected_model == "CLIPflow (Custom Engine)": model = load_clipflow()
-elif selected_model == "GLSCL/DiCoSA (Final Model)": model = load_final_model()
+elif selected_model == "CLIP Advanced": model = load_final_model()
 else: model = DummyModel()
 
 uploaded_file = st.file_uploader("Upload a Video (mp4)", type=["mp4"])
@@ -411,45 +495,66 @@ if uploaded_file is not None:
             else:
                 with st.spinner(f"Searching for the best matches..."):
                     
-                    # --- NATIVE CLIPFLOW SEARCH BYPASS ---
-                    if selected_model == "CLIPflow (Custom Engine)":
-                        text_tokens = model.clip_tokenizer([search_query]).to(model.device)
-                        
-                        with torch.no_grad():
-                            # ✨ FIX #2: Getting the correct model data type for the search bypass ✨
-                            model_dtype = model.clip_model.visual.conv1.weight.dtype
-                            
-                            x = model.clip_model.token_embedding(text_tokens).to(model_dtype)
-                            x = x + model.clip_model.positional_embedding.to(model_dtype)
-                            x = x.permute(1, 0, 2)
-                            x = model.clip_model.transformer(x)
-                            x = x.permute(1, 0, 2)
-                            x = model.clip_model.ln_final(x)
-
-                            text_global = x[torch.arange(x.shape[0]), text_tokens.argmax(dim=-1)]
-                            if model.clip_model.text_projection is not None:
-                                text_global = text_global @ model.clip_model.text_projection
-                                text_words = x @ model.clip_model.text_projection
-                            else:
-                                text_words = x
-                                
-                            text_global = text_global.float()
-                            text_words = text_words.float()
-                            
+                    # --- NATIVE ENGINE SEARCH BYPASS ---
+                    if selected_model in ["CLIPflow (Custom Engine)", "CLIP Advanced"]:
                         results_list = []
-                        # Run your pure engine on every video chunk!
-                        for chunk_path, features in model.video_cache.items():
-                            v_global = features["global"].unsqueeze(0).contiguous()
-                            v_patches = features["patches"].unsqueeze(0).contiguous()
+                        
+                        if selected_model == "CLIPflow (Custom Engine)":
+                            text_tokens = model.clip_tokenizer([search_query]).to(model.device)
+                            with torch.no_grad():
+                                model_dtype = model.clip_model.visual.conv1.weight.dtype
+                                x = model.clip_model.token_embedding(text_tokens).to(model_dtype)
+                                x = x + model.clip_model.positional_embedding.to(model_dtype)
+                                x = x.permute(1, 0, 2)
+                                x = model.clip_model.transformer(x)
+                                x = x.permute(1, 0, 2)
+                                x = model.clip_model.ln_final(x)
+
+                                text_global = x[torch.arange(x.shape[0]), text_tokens.argmax(dim=-1)]
+                                if model.clip_model.text_projection is not None:
+                                    text_global = text_global @ model.clip_model.text_projection
+                                    text_words = x @ model.clip_model.text_projection
+                                else:
+                                    text_words = x
+                                    
+                                text_global = text_global.float()
+                                text_words = text_words.float()
+                                
+                            for chunk_path, features in model.video_cache.items():
+                                v_global = features["global"].unsqueeze(0).contiguous().to(model.device)
+                                v_patches = features["patches"].unsqueeze(0).contiguous().to(model.device)
+                                final_score, _, _ = model.engine(v_global, v_patches, text_global, text_words)
+                                
+                                raw_score = final_score.item()
+                                if raw_score > 1.0: raw_score = raw_score / 100.0 
+                                similarity_score = max(0.0, min(raw_score * 100.0, 100.0))
+                                results_list.append((chunk_path, similarity_score))
+                                
+                        elif selected_model == "CLIP Advanced":
+                            inputs = model.processor(text=[search_query], return_tensors="pt", padding="max_length", truncation=True, max_length=32)
+                            text_ids = inputs["input_ids"].to(model.device)
+                            text_mask = inputs["attention_mask"].to(model.device)
                             
-                            # THE MAGIC HAPPENS HERE: Calling your clipflow_engine.py
-                            final_score, _, _ = model.engine(v_global, v_patches, text_global, text_words)
-                            
-                            similarity_score = max(0, min(final_score.item() * 100, 100))
-                            results_list.append((chunk_path, similarity_score))
-                            
+                            with torch.no_grad():
+                                text_feat, cls_feat = model.model.get_text_feat(text_ids, text_mask)
+                                
+                            for chunk_path, features in model.video_cache.items():
+                                video_feat = features["video_feat"].to(model.device)
+                                video_mask = features["video_mask"].to(model.device)
+                                
+                                with torch.no_grad():
+                                    retrieve_logits, _, _, _ = model.model.similarity(text_feat, cls_feat, video_feat, text_mask, video_mask)
+                                    
+                                # ✨ FIX 2: Use ONLY the pure, refined Cross-Modal retrieval score!
+                                raw_score = retrieve_logits.item()
+                                
+                                # Convert pure cosine similarity to percentage
+                                similarity_score = ((raw_score + 1.0) / 2.0) * 100.0
+                                similarity_score = max(0.0, min(similarity_score, 100.0))
+                                results_list.append((chunk_path, similarity_score))
+
                         results_list.sort(key=lambda x: x[1], reverse=True)
-                        final_results = results_list[:5] # Grab top 5
+                        final_results = results_list[:5] 
                         
                         matches_displayed = 0
                         st.subheader(f"🎯 Top Matches for: '{search_query}'")
